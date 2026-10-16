@@ -296,7 +296,16 @@ describe("devin usage source", () => {
     process.env["DEVIN_ORG_ID"] = "org-test-1";
     process.env["DEVIN_WEBAPP_HOST"] = host;
 
-    await expect(fetchUsage(ENV_INPUT, vi.fn() as never)).rejects.toThrow("not a usable host");
+    const error = await fetchUsage(ENV_INPUT, vi.fn() as never).then(
+      () => {
+        throw new Error("expected fetchUsage to reject");
+      },
+      (caught: unknown) => caught as Error,
+    );
+
+    expect(error.message).toBe("Devin web app host is not a usable host");
+    expect(error.message).not.toContain("evil");
+    expect(error.message).not.toContain("passwd");
   });
 
   it("uses DEVIN_WEBAPP_HOST for env credentials", async () => {

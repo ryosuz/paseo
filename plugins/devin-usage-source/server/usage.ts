@@ -127,7 +127,8 @@ function sanitizeWebappHost(raw: string | undefined): string | undefined {
   try {
     url = new URL(value.includes("://") ? value : `https://${value}`);
   } catch {
-    throw new UnusableStoreError(`Devin web app host is not a usable host: ${value}`);
+    // Never echo the configured value — it can carry userinfo or query tokens.
+    throw new UnusableStoreError("Devin web app host is not a usable host");
   }
   if (
     (url.protocol !== "https:" && url.protocol !== "http:") ||
@@ -138,7 +139,7 @@ function sanitizeWebappHost(raw: string | undefined): string | undefined {
     url.hash ||
     !/^[a-z0-9.-]+(:\d+)?$/i.test(url.host)
   )
-    throw new UnusableStoreError(`Devin web app host is not a usable host: ${value}`);
+    throw new UnusableStoreError("Devin web app host is not a usable host");
   return url.host === DEFAULT_WEBAPP_HOST ? undefined : url.host;
 }
 
@@ -240,8 +241,9 @@ async function fetchJson<Schema extends z.ZodType>(
     });
   } catch (error) {
     // Never echo error.message — header validation errors quote the token.
-    const e = error as NodeJS.ErrnoException | undefined;
-    const label = e?.code ?? e?.name ?? "unknown";
+    // Undici keeps the real failure (ENOTFOUND, ECONNREFUSED) on cause.code.
+    const e = error as (NodeJS.ErrnoException & { cause?: NodeJS.ErrnoException }) | undefined;
+    const label = e?.cause?.code ?? e?.code ?? e?.name ?? "unknown";
     return { kind: "failed", reason: `request failed (${label})` };
   }
   if (res.status === 401 || res.status === 403) return { kind: "rejected", status: res.status };
