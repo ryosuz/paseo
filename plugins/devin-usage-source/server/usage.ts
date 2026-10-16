@@ -16,10 +16,12 @@ import {
   type UsageWindow,
 } from "@getpaseo/plugin/server/usage";
 
-const ApiNumberSchema = z.preprocess(
-  (value) => (value == null || value === "" || typeof value === "boolean" ? undefined : value),
-  z.coerce.number().finite().optional(),
-);
+const ApiNumberSchema = z.preprocess((value) => {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "" && !Number.isNaN(Number(value)))
+    return Number(value);
+  return undefined;
+}, z.number().finite().optional());
 const ApiOptionalStringSchema = z.preprocess(
   (value) => (value == null ? undefined : value),
   z.coerce.string().optional(),
@@ -103,32 +105,47 @@ export function cliPaths(
 } {
   const dataDir =
     platform === "win32"
-      ? (env.APPDATA ?? join(home, "AppData", "Roaming"))
-      : (env.XDG_DATA_HOME ?? join(home, ".local", "share"));
+      ? env.APPDATA || join(home, "AppData", "Roaming")
+      : env.XDG_DATA_HOME || join(home, ".local", "share");
   const configDir =
     platform === "win32"
-      ? (env.APPDATA ?? join(home, "AppData", "Roaming"))
-      : (env.XDG_CONFIG_HOME ?? join(home, ".config"));
+      ? env.APPDATA || join(home, "AppData", "Roaming")
+      : env.XDG_CONFIG_HOME || join(home, ".config");
   return {
     credentialsPath: join(dataDir, "devin", "credentials.toml"),
     configPath: join(configDir, "devin", "config.json"),
   };
 }
 
+// A configured host must be a bare host[:port] or an http(s) URL with no
+// userinfo, path, query, or fragment — anything else could redirect the
+// session token somewhere it does not belong.
 function sanitizeWebappHost(raw: string | undefined): string | undefined {
-  if (!raw) return undefined;
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = raw.trim();
+  let url: URL;
   try {
-    const { host } = new URL(raw.includes("://") ? raw : `https://${raw}`);
-    return host === DEFAULT_WEBAPP_HOST ? undefined : host;
+    url = new URL(value.includes("://") ? value : `https://${value}`);
   } catch {
-    return undefined;
+    throw new UnusableStoreError(`Devin web app host is not a usable host: ${value}`);
   }
+  if (
+    (url.protocol !== "https:" && url.protocol !== "http:") ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash ||
+    !/^[a-z0-9.-]+(:\d+)?$/i.test(url.host)
+  )
+    throw new UnusableStoreError(`Devin web app host is not a usable host: ${value}`);
+  return url.host === DEFAULT_WEBAPP_HOST ? undefined : url.host;
 }
 
 interface CliStore {
   token: string;
   orgId: string;
-  webappHost?: string;
+  rawWebappHost?: string;
 }
 
 async function readCliStore(credentialsPath: string, configPath: string): Promise<CliStore> {
@@ -169,7 +186,7 @@ async function readCliStore(credentialsPath: string, configPath: string): Promis
   const orgId = DevinCliConfigSchema.safeParse(config).data?.devin?.org_id;
   if (!orgId) throw new UnusableStoreError(`${basename(configPath)} has no devin.org_id`);
 
-  return { token, orgId, webappHost: sanitizeWebappHost(WEBAPP_HOST_RE.exec(credentials)?.[1]) };
+  return { token, orgId, rawWebappHost: WEBAPP_HOST_RE.exec(credentials)?.[1] };
 }
 
 function isNotFound(error: unknown): boolean {
@@ -188,7 +205,7 @@ function errorMessage(error: unknown): string {
 interface DevinCredentials {
   token: string;
   orgId: string;
-  webappHost?: string;
+  rawWebappHost?: string;
 }
 
 async function resolveCredentials(input: UsageInput): Promise<DevinCredentials> {
@@ -198,7 +215,7 @@ async function resolveCredentials(input: UsageInput): Promise<DevinCredentials> 
     return {
       token: process.env[input.tokenEnv]!,
       orgId: process.env[input.orgEnv]!,
-      webappHost: sanitizeWebappHost(process.env.DEVIN_WEBAPP_HOST),
+      rawWebappHost: process.env.DEVIN_WEBAPP_HOST,
     };
   }
   return readCliStore(input.credentialsPath, input.configPath);
@@ -281,10 +298,11 @@ export async function fetchUsage(
   input: UsageInput,
   fetchApi: typeof fetch = fetch,
 ): Promise<UsageReport> {
-  const { token, orgId, webappHost } = await resolveCredentials(input);
+  const { token, orgId, rawWebappHost } = await resolveCredentials(input);
+  const webappHost = sanitizeWebappHost(rawWebappHost) ?? DEFAULT_WEBAPP_HOST;
 
   const outcome = await fetchJson(
-    quotaUrl(webappHost ?? DEFAULT_WEBAPP_HOST, orgId),
+    quotaUrl(webappHost, orgId),
     { Authorization: `Bearer ${token}`, "x-cog-org-id": orgId },
     DevinQuotaResponseSchema,
     fetchApi,
@@ -361,14 +379,17 @@ export async function discover(scope: UsageScope): Promise<UsageAccount[]> {
 
   // Env credentials resolve against the daemon's environment at fetch time, so
   // they only exist in global scope — a session's env is not visible to fetch.
-  if (scope.kind === "global") {
-    const tokenEnv = ["DEVIN_API_KEY", "WINDSURF_API_KEY"].find((name) => env[name]);
-    if (env.DEVIN_ORG_ID && tokenEnv)
-      accounts.push({
-        key: accountKey(env.DEVIN_ORG_ID),
-        harness: "environment",
-        input: { store: "env", tokenEnv, orgEnv: "DEVIN_ORG_ID" },
-      });
+  // Every configured token var is advertised so a rejected one can fall back
+  // to the other.
+  if (scope.kind === "global" && env.DEVIN_ORG_ID) {
+    for (const tokenEnv of ["DEVIN_API_KEY", "WINDSURF_API_KEY"]) {
+      if (env[tokenEnv])
+        accounts.push({
+          key: accountKey(env.DEVIN_ORG_ID),
+          harness: tokenEnv,
+          input: { store: "env", tokenEnv, orgEnv: "DEVIN_ORG_ID" },
+        });
+    }
   }
 
   const { credentialsPath, configPath } = cliPaths(env, home);
@@ -380,8 +401,10 @@ export async function discover(scope: UsageScope): Promise<UsageAccount[]> {
       input: { store: "file", credentialsPath, configPath },
     });
   } catch (error) {
-    // Unusable store contents mean "no login"; I/O failures stay visible.
-    if (!(error instanceof UnusableStoreError)) throw error;
+    // Unusable store contents mean "no login". I/O failures must not take the
+    // env accounts down with them, so they are logged instead of thrown.
+    if (!(error instanceof UnusableStoreError))
+      console.warn(`devin-usage-source: skipping CLI store: ${errorMessage(error)}`);
   }
 
   return accounts;

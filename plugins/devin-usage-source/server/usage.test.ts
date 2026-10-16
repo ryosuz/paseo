@@ -47,12 +47,13 @@ function writeCliStore(
   home: string,
   files: { credentials?: string; config?: string; dataDir?: string; configDir?: string },
 ): { credentialsPath: string; configPath: string } {
-  const credentialsPath = join(
-    files.dataDir ?? join(home, ".local", "share"),
-    "devin",
-    "credentials.toml",
-  );
-  const configPath = join(files.configDir ?? join(home, ".config"), "devin", "config.json");
+  const defaults = cliPaths(process.env, home);
+  const credentialsPath = files.dataDir
+    ? join(files.dataDir, "devin", "credentials.toml")
+    : defaults.credentialsPath;
+  const configPath = files.configDir
+    ? join(files.configDir, "devin", "config.json")
+    : defaults.configPath;
   mkdirSync(dirname(credentialsPath), { recursive: true });
   mkdirSync(dirname(configPath), { recursive: true });
   writeFileSync(credentialsPath, files.credentials ?? 'windsurf_api_key = "devin-session-token"\n');
@@ -158,7 +159,7 @@ describe("devin usage source", () => {
     });
   });
 
-  it.each([null, "", false])(
+  it.each([null, "", "   ", false, [], ["42"]])(
     "does not turn a %s percentage into a fabricated bar",
     async (value) => {
       process.env["DEVIN_API_KEY"] = "devin-token";
@@ -283,6 +284,19 @@ describe("devin usage source", () => {
         expect.objectContaining({ id: "weekly" }),
       ],
     });
+  });
+
+  it.each([
+    "file:///etc/passwd",
+    "https://user:pass@evil.example.com",
+    "https://evil.example.com/path",
+    "https://evil.example.com/?x=1",
+  ])("rejects a configured web app host that could redirect the token: %s", async (host) => {
+    process.env["DEVIN_API_KEY"] = "devin-token";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+    process.env["DEVIN_WEBAPP_HOST"] = host;
+
+    await expect(fetchUsage(ENV_INPUT, vi.fn() as never)).rejects.toThrow("not a usable host");
   });
 
   it("uses DEVIN_WEBAPP_HOST for env credentials", async () => {
@@ -558,7 +572,7 @@ describe("account discovery", () => {
     expect(await discover(globalScope)).toEqual([
       {
         key: hashAccountKey("org-test-1"),
-        harness: "environment",
+        harness: "DEVIN_API_KEY",
         input: { store: "env", tokenEnv: "DEVIN_API_KEY", orgEnv: "DEVIN_ORG_ID" },
       },
     ]);
@@ -571,10 +585,26 @@ describe("account discovery", () => {
     expect(await discover(globalScope)).toEqual([
       {
         key: hashAccountKey("org-test-1"),
-        harness: "environment",
+        harness: "WINDSURF_API_KEY",
         input: { store: "env", tokenEnv: "WINDSURF_API_KEY", orgEnv: "DEVIN_ORG_ID" },
       },
     ]);
+  });
+
+  it("advertises both env tokens under the same account", async () => {
+    process.env["DEVIN_API_KEY"] = "devin-token";
+    process.env["WINDSURF_API_KEY"] = "windsurf-token";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+
+    const accounts = await discover(globalScope);
+
+    expect(accounts.map((account) => account.harness)).toEqual([
+      "DEVIN_API_KEY",
+      "WINDSURF_API_KEY",
+    ]);
+    expect(new Set(accounts.map((account) => account.key))).toEqual(
+      new Set([hashAccountKey("org-test-1")]),
+    );
   });
 
   it("discovers the Devin CLI login store", async () => {
@@ -600,7 +630,7 @@ describe("account discovery", () => {
     expect(new Set(accounts.map((account) => account.key))).toEqual(
       new Set([hashAccountKey("org-test-1")]),
     );
-    expect(accounts.map((account) => account.harness)).toEqual(["environment", "Devin CLI"]);
+    expect(accounts.map((account) => account.harness)).toEqual(["DEVIN_API_KEY", "Devin CLI"]);
   });
 
   it("keeps env and CLI logins of different orgs on separate accounts", async () => {
@@ -685,10 +715,61 @@ describe("account discovery", () => {
   it("resolves Windows store paths under APPDATA", () => {
     const paths = cliPaths({ APPDATA: "C:\\Users\\u\\AppData\\Roaming" }, "C:\\Users\\u", "win32");
 
-    expect(paths.credentialsPath).toContain("AppData");
-    expect(paths.credentialsPath).toContain("credentials.toml");
-    expect(paths.configPath).toContain("AppData");
-    expect(paths.configPath).toContain("config.json");
+    expect(paths).toEqual({
+      credentialsPath: join("C:\\Users\\u\\AppData\\Roaming", "devin", "credentials.toml"),
+      configPath: join("C:\\Users\\u\\AppData\\Roaming", "devin", "config.json"),
+    });
+  });
+
+  it("treats empty XDG and APPDATA overrides as unset", async () => {
+    process.env["XDG_DATA_HOME"] = "";
+    process.env["XDG_CONFIG_HOME"] = "";
+    process.env["APPDATA"] = "";
+    writeCliStore(homeDir, {});
+
+    const accounts = await discover(globalScope);
+
+    expect(
+      accounts.map((account) => (account.input as { credentialsPath: string }).credentialsPath),
+    ).toEqual([join(homeDir, ".local", "share", "devin", "credentials.toml")]);
+  });
+
+  it("keeps env accounts when the CLI store fails with an I/O error", async () => {
+    process.env["DEVIN_API_KEY"] = "devin-token";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+    // A directory where credentials.toml belongs makes readFile fail with EISDIR.
+    mkdirSync(join(homeDir, ".local", "share", "devin", "credentials.toml"), {
+      recursive: true,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const accounts = await discover(globalScope);
+
+      expect(accounts).toEqual([
+        {
+          key: hashAccountKey("org-test-1"),
+          harness: "DEVIN_API_KEY",
+          input: { store: "env", tokenEnv: "DEVIN_API_KEY", orgEnv: "DEVIN_ORG_ID" },
+        },
+      ]);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0]![0]).toContain("skipping CLI store");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not put credential values into discovered inputs", async () => {
+    process.env["DEVIN_API_KEY"] = "devin-secret-token";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+    writeCliStore(homeDir, {});
+
+    const accounts = await discover(globalScope);
+    const serialized = JSON.stringify(accounts);
+
+    expect(serialized).not.toContain("devin-secret-token");
+    expect(serialized).not.toContain("devin-session-token");
   });
 
   it("rejects inputs carrying unexpected credential-bearing fields", () => {
