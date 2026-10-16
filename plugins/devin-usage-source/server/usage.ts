@@ -149,7 +149,13 @@ export async function fetchUsage(
     DevinQuotaResponseSchema,
     fetchApi,
   );
-  if (outcome.kind === "rejected") return unavailable({ kind: "rejected", status: outcome.status });
+  if (outcome.kind === "rejected")
+    return unavailable({
+      kind: "rejected",
+      status: outcome.status,
+      // File-store tokens refresh through the CLI; env vars have no command to point at.
+      ...(input.store === "file" ? { refreshedBy: "devin auth login" } : {}),
+    });
   if (outcome.kind === "failed")
     return { status: "error", error: "Devin usage API request failed" };
 

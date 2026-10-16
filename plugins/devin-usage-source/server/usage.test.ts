@@ -147,7 +147,7 @@ describe("devin usage source", () => {
     });
   });
 
-  it.each([401, 403])("reports a rejected login with HTTP %i", async (status) => {
+  it.each([401, 403])("reports a rejected env login with HTTP %i", async (status) => {
     process.env["DEVIN_API_KEY"] = "devin-token";
     process.env["DEVIN_ORG_ID"] = "org-test-1";
     const report = await fetchUsage(
@@ -156,6 +156,25 @@ describe("devin usage source", () => {
     );
 
     expect(report).toEqual({ status: "unavailable", problem: { kind: "rejected", status } });
+  });
+
+  it("points a rejected CLI login at devin auth login", async () => {
+    const credentialsPath = join(homeDir, ".local", "share", "devin", "credentials.toml");
+    const configPath = join(homeDir, ".config", "devin", "config.json");
+    mkdirSync(dirname(credentialsPath), { recursive: true });
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(credentialsPath, 'windsurf_api_key = "devin-session-token"\n');
+    writeFileSync(configPath, JSON.stringify({ devin: { org_id: "org-test-1" } }));
+
+    const report = await fetchUsage(
+      { store: "file", credentialsPath, configPath },
+      mockFetch(new Map([[QUOTA_URL, () => new Response(null, { status: 401 })]])),
+    );
+
+    expect(report).toEqual({
+      status: "unavailable",
+      problem: { kind: "rejected", status: 401, refreshedBy: "devin auth login" },
+    });
   });
 
   it("reports an error when the request fails", async () => {
