@@ -8,7 +8,7 @@ import type { UsageInput } from "../shared/input.js";
 const QUOTA_URL = "https://app.devin.ai/api/org-test-1/billing/quota/usage";
 
 function mockFetch(handlers: Map<string, () => Response>): typeof fetch {
-  return vi.fn(async (url: RequestInfo | URL) => {
+  return vi.fn(async (url: Parameters<typeof fetch>[0]) => {
     const handler = handlers.get(url.toString());
     if (!handler) throw new Error(`Unmocked fetch: ${url.toString()}`);
     return handler();
@@ -200,7 +200,7 @@ describe("devin usage source", () => {
     writeFileSync(configPath, JSON.stringify({ devin: { org_id: "org-test-1" } }));
 
     let seenHeaders: Record<string, string> | undefined;
-    const fetchApi = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const fetchApi = vi.fn(async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
       seenHeaders = Object.fromEntries(
         Object.entries((init?.headers ?? {}) as Record<string, string>),
       );

@@ -1,1 +1,1 @@
-{ "id": "devin-usage-source", "requirements": { "paseo": ">=0.9.2" } }
+{ "id": "devin-usage-source", "requirements": { "paseo": ">=0.11.0" } }
