@@ -7,7 +7,6 @@ import {
   windowFromUsedPct,
   type UsageAccount,
   type UsageReport,
-  type UsageDetail,
   type UsageWindow,
 } from "@getpaseo/plugin/server/usage";
 
@@ -17,37 +16,9 @@ const ApiOptionalStringSchema = z.preprocess(
   z.coerce.string().optional(),
 );
 
-const SUBSCRIPTION_URL = "https://api.z.ai/api/biz/subscription/list";
 // The Z.AI dashboard's own quota endpoint. Undocumented; community implementations
 // (cc-switch, tokn, quota-bar) agree it takes the raw key with no Bearer prefix.
 const QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
-
-const ZaiUsageResponseSchema = z.object({
-  data: z
-    .array(
-      z.object({
-        productName: ApiOptionalStringSchema,
-        status: ApiOptionalStringSchema,
-        purchaseTime: ApiOptionalStringSchema,
-        valid: ApiOptionalStringSchema,
-        // Accounts renewing across periods return one row per period; the live
-        // subscription is the one flagged inCurrentPeriod, not always the first.
-        inCurrentPeriod: z.unknown().optional(),
-      }),
-    )
-    .optional(),
-});
-
-function currentSubscription(
-  data: z.infer<typeof ZaiUsageResponseSchema>["data"],
-): ZaiSubscription | undefined {
-  const subs = data ?? [];
-  return (
-    subs.find((sub) => sub.inCurrentPeriod === true || sub.inCurrentPeriod === 1) ??
-    subs.find((sub) => sub.status === "VALID") ??
-    subs[0]
-  );
-}
 
 // Quota `limits` rows. CREDIT_LIMIT/TOKENS_LIMIT rows name their window with a
 // (unit, number) pair — (3, 5) is the five-hour credit window, (6, 1) is weekly.
@@ -81,33 +52,11 @@ const ZaiQuotaResponseSchema = z.object({
 
 type ZaiQuotaLimit = z.infer<typeof ZaiQuotaLimitSchema>;
 type ZaiQuotaData = NonNullable<z.infer<typeof ZaiQuotaResponseSchema>["data"]>;
-type ZaiSubscription = NonNullable<z.infer<typeof ZaiUsageResponseSchema>["data"]>[number];
 
 type FetchOutcome<T> =
   | { kind: "ok"; value: T }
   | { kind: "rejected"; status: number }
   | { kind: "failed" };
-
-function combinedFailureReport(
-  subscription: FetchOutcome<unknown>,
-  quota: FetchOutcome<unknown>,
-): UsageReport | null {
-  if (subscription.kind === "rejected" && quota.kind === "rejected")
-    return unavailable({ kind: "rejected", status: subscription.status });
-  if (subscription.kind === "failed" && quota.kind === "failed")
-    return { status: "error", error: "Z.ai usage API request failed" };
-  return null;
-}
-
-function subscriptionDetails(sub: ZaiSubscription | undefined): UsageDetail[] {
-  const details: UsageDetail[] = [];
-  if (sub?.status) details.push({ id: "status", label: "Status", value: sub.status });
-  if (sub?.valid) details.push({ id: "valid", label: "Valid", value: sub.valid });
-  if (sub?.purchaseTime) {
-    details.push({ id: "purchase_time", label: "Purchased", value: sub.purchaseTime });
-  }
-  return details;
-}
 
 async function fetchJson<Schema extends z.ZodType>(
   url: string,
@@ -276,34 +225,27 @@ export async function fetchUsage(
   const token = process.env[input.locator];
   if (!token) throw new Error("Z.ai login store no longer exists");
 
-  const [subscription, quota] = await Promise.all([
-    fetchJson(
-      SUBSCRIPTION_URL,
-      { Authorization: `Bearer ${token}` },
-      ZaiUsageResponseSchema,
-      fetchApi,
-    ),
-    fetchJson(QUOTA_URL, { Authorization: token }, ZaiQuotaResponseSchema, fetchApi),
-  ]);
+  const quota = await fetchJson(
+    QUOTA_URL,
+    { Authorization: token },
+    ZaiQuotaResponseSchema,
+    fetchApi,
+  );
+  if (quota.kind === "rejected") return unavailable({ kind: "rejected", status: quota.status });
+  if (quota.kind === "failed") return { status: "error", error: "Z.ai usage API request failed" };
 
-  const failure = combinedFailureReport(subscription, quota);
-  if (failure) return failure;
-
-  const sub = subscription.kind === "ok" ? currentSubscription(subscription.value.data) : undefined;
-  const quotaData = quota.kind === "ok" ? (quota.value.data ?? undefined) : undefined;
-
+  const quotaData = quota.value.data ?? undefined;
   const windows = buildLimitWindows(quotaData);
   if (windows.length === 0 && quotaData) windows.push(...buildLegacyWindows(quotaData));
 
-  if (!sub && windows.length === 0)
+  if (windows.length === 0 && !quotaData?.level)
     return unavailable({ kind: "no_quota", detail: "No active coding plan" });
 
   return {
     status: "available",
-    planLabel: sub?.productName || planLabelFromLevel(quotaData?.level),
+    planLabel: planLabelFromLevel(quotaData?.level),
     windows,
     balances: [],
-    details: subscriptionDetails(sub),
   };
 }
 

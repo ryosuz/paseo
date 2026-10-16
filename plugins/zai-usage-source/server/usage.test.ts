@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { discover, fetchUsage } from "./usage.js";
 import type { UsageReport } from "@getpaseo/plugin/server/usage";
 
+const QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
+
 function mockFetch(handlers: Map<string, () => Response>): typeof fetch {
   return vi.fn(async (url: RequestInfo | URL) => {
     const key = url.toString();
@@ -55,14 +57,7 @@ describe("zai usage source", () => {
     for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
     for (const key in originalEnv) process.env[key] = originalEnv[key];
   });
-  function service(
-    _options: {
-      platform?: typeof process.platform;
-      keychain?: () => Promise<unknown | null>;
-      cursorHomeDir?: string;
-      kimiHomeDir?: string;
-    } = {},
-  ) {
+  function service() {
     return {
       listUsage: async () => {
         const report = await fetchFirst((url, init) => fetchApi(url, init));
@@ -87,26 +82,12 @@ describe("zai usage source", () => {
     if (!report) throw new Error(`Missing usage source ${id}`);
     return report;
   }
-  it("fetches Z.ai usage from ZAI_API_KEY", async () => {
+  it("maps (unit, number) quota rows to session and weekly windows", async () => {
     process.env["ZAI_API_KEY"] = "zai_test_token";
     fetchApi = mockFetch(
       new Map([
         [
-          "https://api.z.ai/api/biz/subscription/list",
-          () =>
-            jsonResponse({
-              data: [
-                {
-                  productName: "GLM Coding Max",
-                  status: "VALID",
-                  purchaseTime: "2026-01-12 16:55:13",
-                  valid: "2026-02-12 16:55:13-2026-03-12 16:55:13",
-                },
-              ],
-            }),
-        ],
-        [
-          "https://api.z.ai/api/monitor/usage/quota/limit",
+          QUOTA_URL,
           () =>
             jsonResponse({
               code: 200,
@@ -145,7 +126,6 @@ describe("zai usage source", () => {
     expect(zai).toMatchObject({
       status: "available",
       planLabel: "GLM Coding Max",
-      details: expect.arrayContaining([{ id: "status", label: "Status", value: "VALID" }]),
       windows: [
         expect.objectContaining({
           id: "five_hour",
@@ -166,13 +146,12 @@ describe("zai usage source", () => {
     });
   });
 
-  it("derives the plan label and windows from quota when the subscription list is empty", async () => {
+  it("fills unclassified rows into empty windows by earliest reset", async () => {
     process.env["ZAI_API_KEY"] = "zai_test_token";
     fetchApi = mockFetch(
       new Map([
-        ["https://api.z.ai/api/biz/subscription/list", () => jsonResponse({ data: [] })],
         [
-          "https://api.z.ai/api/monitor/usage/quota/limit",
+          QUOTA_URL,
           () =>
             jsonResponse({
               code: 200,
@@ -200,85 +179,17 @@ describe("zai usage source", () => {
     });
   });
 
-  it("keeps the subscription report when the quota endpoint fails", async () => {
-    process.env["ZAI_API_KEY"] = "zai_test_token";
-    fetchApi = mockFetch(
-      new Map([
-        [
-          "https://api.z.ai/api/biz/subscription/list",
-          () =>
-            jsonResponse({
-              data: [{ productName: "GLM Coding Max", status: "VALID" }],
-            }),
-        ],
-        [
-          "https://api.z.ai/api/monitor/usage/quota/limit",
-          () => new Response(null, { status: 500 }),
-        ],
-      ]),
-    );
-
-    const zai = findProvider(await service().listUsage(), "zai");
-
-    expect(zai).toMatchObject({
-      status: "available",
-      planLabel: "GLM Coding Max",
-      windows: [],
-    });
-  });
-
-  it("keeps quota windows when the subscription endpoint fails", async () => {
-    process.env["ZAI_API_KEY"] = "zai_test_token";
-    fetchApi = mockFetch(
-      new Map([
-        ["https://api.z.ai/api/biz/subscription/list", () => new Response(null, { status: 500 })],
-        [
-          "https://api.z.ai/api/monitor/usage/quota/limit",
-          () =>
-            jsonResponse({
-              code: 200,
-              data: {
-                level: "lite",
-                limits: [
-                  {
-                    type: "CREDIT_LIMIT",
-                    unit: 3,
-                    number: 5,
-                    usage: 2000,
-                    currentValue: 1900,
-                    remaining: 100,
-                    percentage: 95,
-                  },
-                ],
-              },
-            }),
-        ],
-      ]),
-    );
-
-    const zai = findProvider(await service().listUsage(), "zai");
-
-    expect(zai).toMatchObject({
-      status: "available",
-      planLabel: "GLM Coding Lite",
-      windows: [expect.objectContaining({ id: "five_hour", usedPct: 95, tone: "danger" })],
-    });
-  });
-
   it("reports the monthly MCP budget as its own window", async () => {
     process.env["ZAI_API_KEY"] = "zai_test_token";
     fetchApi = mockFetch(
       new Map([
         [
-          "https://api.z.ai/api/biz/subscription/list",
-          () => jsonResponse({ data: [{ productName: "GLM Coding Pro" }] }),
-        ],
-        [
-          "https://api.z.ai/api/monitor/usage/quota/limit",
+          QUOTA_URL,
           () =>
             jsonResponse({
               code: 200,
               data: {
+                level: "pro",
                 limits: [{ type: "TIME_LIMIT", usage: 8, currentValue: 6, remaining: 2 }],
               },
             }),
@@ -290,6 +201,7 @@ describe("zai usage source", () => {
 
     expect(zai).toMatchObject({
       status: "available",
+      planLabel: "GLM Coding Pro",
       windows: [expect.objectContaining({ id: "mcp_monthly", usedPct: 75 })],
     });
   });
@@ -299,15 +211,11 @@ describe("zai usage source", () => {
     fetchApi = mockFetch(
       new Map([
         [
-          "https://api.z.ai/api/biz/subscription/list",
-          () => jsonResponse({ data: [{ productName: "GLM Coding Pro" }] }),
-        ],
-        [
-          "https://api.z.ai/api/monitor/usage/quota/limit",
+          QUOTA_URL,
           () =>
             jsonResponse({
               code: 200,
-              data: { fiveHourPercent: 61, weeklyPercent: 9 },
+              data: { level: "lite", fiveHourPercent: 61, weeklyPercent: 9 },
             }),
         ],
       ]),
@@ -317,6 +225,7 @@ describe("zai usage source", () => {
 
     expect(zai).toMatchObject({
       status: "available",
+      planLabel: "GLM Coding Lite",
       windows: [
         expect.objectContaining({ id: "five_hour", usedPct: 61 }),
         expect.objectContaining({ id: "weekly", usedPct: 9 }),
@@ -324,16 +233,22 @@ describe("zai usage source", () => {
     });
   });
 
-  it("reports no quota when neither endpoint has plan data", async () => {
+  it("reports an error when the quota request fails", async () => {
+    process.env["ZAI_API_KEY"] = "zai_test_token";
+    fetchApi = mockFetch(new Map([[QUOTA_URL, () => new Response(null, { status: 500 })]]));
+
+    const zai = findProvider(await service().listUsage(), "zai");
+
+    expect(zai).toMatchObject({
+      status: "error",
+      error: "Z.ai usage API request failed",
+    });
+  });
+
+  it("reports no quota when the response has no plan data", async () => {
     process.env["ZAI_API_KEY"] = "zai_test_token";
     fetchApi = mockFetch(
-      new Map([
-        ["https://api.z.ai/api/biz/subscription/list", () => jsonResponse({ data: [] })],
-        [
-          "https://api.z.ai/api/monitor/usage/quota/limit",
-          () => jsonResponse({ code: 200, data: { limits: [] } }),
-        ],
-      ]),
+      new Map([[QUOTA_URL, () => jsonResponse({ code: 200, data: { limits: [] } })]]),
     );
 
     const zai = findProvider(await service().listUsage(), "zai");
