@@ -105,6 +105,38 @@ describe("zai usage source", () => {
               ],
             }),
         ],
+        [
+          "https://api.z.ai/api/monitor/usage/quota/limit",
+          () =>
+            jsonResponse({
+              code: 200,
+              success: true,
+              data: {
+                level: "max",
+                limits: [
+                  {
+                    type: "CREDIT_LIMIT",
+                    unit: 3,
+                    number: 5,
+                    usage: 28000,
+                    currentValue: 8400,
+                    remaining: 19600,
+                    percentage: 30,
+                  },
+                  {
+                    type: "CREDIT_LIMIT",
+                    unit: 6,
+                    number: 1,
+                    usage: 140000,
+                    currentValue: 70000,
+                    remaining: 70000,
+                    percentage: 50,
+                    nextResetTime: 1787649214999,
+                  },
+                ],
+              },
+            }),
+        ],
       ]),
     );
 
@@ -114,6 +146,201 @@ describe("zai usage source", () => {
       status: "available",
       planLabel: "GLM Coding Max",
       details: expect.arrayContaining([{ id: "status", label: "Status", value: "VALID" }]),
+      windows: [
+        expect.objectContaining({
+          id: "five_hour",
+          label: "Session",
+          shortLabel: "5h",
+          summary: true,
+          usedPct: 30,
+          remainingPct: 70,
+        }),
+        expect.objectContaining({
+          id: "weekly",
+          label: "Weekly",
+          shortLabel: "wk",
+          usedPct: 50,
+          resetsAt: "2026-08-25T09:13:34.999Z",
+        }),
+      ],
+    });
+  });
+
+  it("derives the plan label and windows from quota when the subscription list is empty", async () => {
+    process.env["ZAI_API_KEY"] = "zai_test_token";
+    fetchApi = mockFetch(
+      new Map([
+        ["https://api.z.ai/api/biz/subscription/list", () => jsonResponse({ data: [] })],
+        [
+          "https://api.z.ai/api/monitor/usage/quota/limit",
+          () =>
+            jsonResponse({
+              code: 200,
+              data: {
+                level: "pro",
+                limits: [
+                  { type: "TOKENS_LIMIT", percentage: 44, nextResetTime: 1740000000000 },
+                  { type: "TOKENS_LIMIT", percentage: 12, nextResetTime: 1750000000000 },
+                ],
+              },
+            }),
+        ],
+      ]),
+    );
+
+    const zai = findProvider(await service().listUsage(), "zai");
+
+    expect(zai).toMatchObject({
+      status: "available",
+      planLabel: "GLM Coding Pro",
+      windows: [
+        expect.objectContaining({ id: "five_hour", usedPct: 44 }),
+        expect.objectContaining({ id: "weekly", usedPct: 12 }),
+      ],
+    });
+  });
+
+  it("keeps the subscription report when the quota endpoint fails", async () => {
+    process.env["ZAI_API_KEY"] = "zai_test_token";
+    fetchApi = mockFetch(
+      new Map([
+        [
+          "https://api.z.ai/api/biz/subscription/list",
+          () =>
+            jsonResponse({
+              data: [{ productName: "GLM Coding Max", status: "VALID" }],
+            }),
+        ],
+        [
+          "https://api.z.ai/api/monitor/usage/quota/limit",
+          () => new Response(null, { status: 500 }),
+        ],
+      ]),
+    );
+
+    const zai = findProvider(await service().listUsage(), "zai");
+
+    expect(zai).toMatchObject({
+      status: "available",
+      planLabel: "GLM Coding Max",
+      windows: [],
+    });
+  });
+
+  it("keeps quota windows when the subscription endpoint fails", async () => {
+    process.env["ZAI_API_KEY"] = "zai_test_token";
+    fetchApi = mockFetch(
+      new Map([
+        ["https://api.z.ai/api/biz/subscription/list", () => new Response(null, { status: 500 })],
+        [
+          "https://api.z.ai/api/monitor/usage/quota/limit",
+          () =>
+            jsonResponse({
+              code: 200,
+              data: {
+                level: "lite",
+                limits: [
+                  {
+                    type: "CREDIT_LIMIT",
+                    unit: 3,
+                    number: 5,
+                    usage: 2000,
+                    currentValue: 1900,
+                    remaining: 100,
+                    percentage: 95,
+                  },
+                ],
+              },
+            }),
+        ],
+      ]),
+    );
+
+    const zai = findProvider(await service().listUsage(), "zai");
+
+    expect(zai).toMatchObject({
+      status: "available",
+      planLabel: "GLM Coding Lite",
+      windows: [expect.objectContaining({ id: "five_hour", usedPct: 95, tone: "danger" })],
+    });
+  });
+
+  it("reports the monthly MCP budget as its own window", async () => {
+    process.env["ZAI_API_KEY"] = "zai_test_token";
+    fetchApi = mockFetch(
+      new Map([
+        [
+          "https://api.z.ai/api/biz/subscription/list",
+          () => jsonResponse({ data: [{ productName: "GLM Coding Pro" }] }),
+        ],
+        [
+          "https://api.z.ai/api/monitor/usage/quota/limit",
+          () =>
+            jsonResponse({
+              code: 200,
+              data: {
+                limits: [{ type: "TIME_LIMIT", usage: 8, currentValue: 6, remaining: 2 }],
+              },
+            }),
+        ],
+      ]),
+    );
+
+    const zai = findProvider(await service().listUsage(), "zai");
+
+    expect(zai).toMatchObject({
+      status: "available",
+      windows: [expect.objectContaining({ id: "mcp_monthly", usedPct: 75 })],
+    });
+  });
+
+  it("maps legacy flat percent fields", async () => {
+    process.env["ZAI_API_KEY"] = "zai_test_token";
+    fetchApi = mockFetch(
+      new Map([
+        [
+          "https://api.z.ai/api/biz/subscription/list",
+          () => jsonResponse({ data: [{ productName: "GLM Coding Pro" }] }),
+        ],
+        [
+          "https://api.z.ai/api/monitor/usage/quota/limit",
+          () =>
+            jsonResponse({
+              code: 200,
+              data: { fiveHourPercent: 61, weeklyPercent: 9 },
+            }),
+        ],
+      ]),
+    );
+
+    const zai = findProvider(await service().listUsage(), "zai");
+
+    expect(zai).toMatchObject({
+      status: "available",
+      windows: [
+        expect.objectContaining({ id: "five_hour", usedPct: 61 }),
+        expect.objectContaining({ id: "weekly", usedPct: 9 }),
+      ],
+    });
+  });
+
+  it("reports no quota when neither endpoint has plan data", async () => {
+    process.env["ZAI_API_KEY"] = "zai_test_token";
+    fetchApi = mockFetch(
+      new Map([
+        ["https://api.z.ai/api/biz/subscription/list", () => jsonResponse({ data: [] })],
+        [
+          "https://api.z.ai/api/monitor/usage/quota/limit",
+          () => jsonResponse({ code: 200, data: { limits: [] } }),
+        ],
+      ]),
+    );
+
+    const zai = findProvider(await service().listUsage(), "zai");
+
+    expect(zai).toMatchObject({
+      status: "unavailable",
+      problem: { kind: "no_quota", detail: "No active coding plan" },
     });
   });
 });
