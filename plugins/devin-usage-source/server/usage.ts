@@ -22,22 +22,18 @@ const ApiNumberSchema = z.preprocess((value) => {
     return Number(value);
   return undefined;
 }, z.number().finite().optional());
-const ApiOptionalStringSchema = z.preprocess(
-  (value) => (value == null ? undefined : value),
-  z.coerce.string().optional(),
-);
 // Reset timestamps arrive as ISO strings or epoch seconds/millis; normalize so
 // the app can always parse them.
 const ApiResetSchema = z.preprocess((value) => normalizeReset(value), z.string().optional());
 
-const DEFAULT_WEBAPP_HOST = "app.devin.ai";
+const DEFAULT_API_ORIGIN = "https://app.devin.ai";
 
 // The Devin web dashboard's own quota endpoint. Undocumented. The Devin CLI
 // session token authenticates as Bearer here — verified against a live login —
 // with the org id on x-cog-org-id. Enterprise deployments report their own
 // devin_webapp_host, which is where that login's token is valid.
-const quotaUrl = (webappHost: string, orgId: string) =>
-  `https://${webappHost}/api/${encodeURIComponent(orgId)}/billing/quota/usage`;
+const quotaUrl = (apiOrigin: string, orgId: string) =>
+  `${apiOrigin}/api/${encodeURIComponent(orgId)}/billing/quota/usage`;
 
 const DevinQuotaResponseSchema = z.object({
   is_quota_plan: z.boolean().optional(),
@@ -53,7 +49,7 @@ const DevinQuotaResponseSchema = z.object({
 });
 
 const DevinCliConfigSchema = z.object({
-  devin: z.object({ org_id: ApiOptionalStringSchema }).optional(),
+  devin: z.object({ org_id: z.string().optional() }).optional(),
 });
 
 // Devin CLI credentials written by `devin auth login`. The session token lives
@@ -90,6 +86,7 @@ function stripJsonComments(source: string): string {
       i += 2;
       while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
       i++;
+      out += " ";
     } else out += ch;
   }
   return out;
@@ -119,7 +116,7 @@ export function cliPaths(
 
 // A configured host must be a bare host[:port] or an http(s) URL with no
 // userinfo, path, query, or fragment — anything else could redirect the
-// session token somewhere it does not belong.
+// session token somewhere it does not belong. Returns the request origin.
 function sanitizeWebappHost(raw: string | undefined): string | undefined {
   if (raw === undefined || raw.trim() === "") return undefined;
   const value = raw.trim();
@@ -140,16 +137,19 @@ function sanitizeWebappHost(raw: string | undefined): string | undefined {
     !/^[a-z0-9.-]+(:\d+)?$/i.test(url.host)
   )
     throw new UnusableStoreError("Devin web app host is not a usable host");
-  return url.host === DEFAULT_WEBAPP_HOST ? undefined : url.host;
+  return url.origin === DEFAULT_API_ORIGIN ? undefined : url.origin;
 }
 
-interface CliStore {
+interface DevinCredentials {
   token: string;
   orgId: string;
   rawWebappHost?: string;
 }
 
-async function readCliStore(credentialsPath: string, configPath: string): Promise<CliStore> {
+async function readCliStore(
+  credentialsPath: string,
+  configPath: string,
+): Promise<DevinCredentials> {
   let credentials: string;
   try {
     credentials = await readFile(credentialsPath, "utf8");
@@ -201,12 +201,6 @@ function isNotFound(error: unknown): boolean {
 function errorMessage(error: unknown): string {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   return code ?? (error instanceof Error ? error.message : String(error));
-}
-
-interface DevinCredentials {
-  token: string;
-  orgId: string;
-  rawWebappHost?: string;
 }
 
 async function resolveCredentials(input: UsageInput): Promise<DevinCredentials> {
@@ -301,10 +295,10 @@ export async function fetchUsage(
   fetchApi: typeof fetch = fetch,
 ): Promise<UsageReport> {
   const { token, orgId, rawWebappHost } = await resolveCredentials(input);
-  const webappHost = sanitizeWebappHost(rawWebappHost) ?? DEFAULT_WEBAPP_HOST;
+  const apiOrigin = sanitizeWebappHost(rawWebappHost) ?? DEFAULT_API_ORIGIN;
 
   const outcome = await fetchJson(
-    quotaUrl(webappHost, orgId),
+    quotaUrl(apiOrigin, orgId),
     { Authorization: `Bearer ${token}`, "x-cog-org-id": orgId },
     DevinQuotaResponseSchema,
     fetchApi,
@@ -367,10 +361,6 @@ export async function fetchUsage(
   return { status: "available", windows, balances };
 }
 
-function accountKey(orgId: string): string {
-  return hashAccountKey(orgId);
-}
-
 export async function discover(scope: UsageScope): Promise<UsageAccount[]> {
   // Session discovery only applies to Devin's own agent sessions — every other
   // provider's session would otherwise surface this machine's Devin login.
@@ -387,7 +377,7 @@ export async function discover(scope: UsageScope): Promise<UsageAccount[]> {
     for (const tokenEnv of ["DEVIN_API_KEY", "WINDSURF_API_KEY"]) {
       if (env[tokenEnv])
         accounts.push({
-          key: accountKey(env.DEVIN_ORG_ID),
+          key: hashAccountKey(env.DEVIN_ORG_ID),
           harness: tokenEnv,
           input: { store: "env", tokenEnv, orgEnv: "DEVIN_ORG_ID" },
         });
@@ -398,7 +388,7 @@ export async function discover(scope: UsageScope): Promise<UsageAccount[]> {
   try {
     const store = await readCliStore(credentialsPath, configPath);
     accounts.push({
-      key: accountKey(store.orgId),
+      key: hashAccountKey(store.orgId),
       harness: "Devin CLI",
       input: { store: "file", credentialsPath, configPath },
     });

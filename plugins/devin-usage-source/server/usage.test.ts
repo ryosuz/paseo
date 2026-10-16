@@ -323,6 +323,23 @@ describe("devin usage source", () => {
     expect(seenUrls).toEqual(["https://devin.acme.example.com/api/org-test-1/billing/quota/usage"]);
   });
 
+  it("honors an explicit http scheme for the configured web app host", async () => {
+    process.env["DEVIN_API_KEY"] = "devin-token";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+    process.env["DEVIN_WEBAPP_HOST"] = "http://devin.internal.example.com:8080";
+    const seenUrls: string[] = [];
+    const fetchApi = vi.fn(async (url: Parameters<typeof fetch>[0]) => {
+      seenUrls.push(url.toString());
+      return quotaResponse();
+    }) as unknown as typeof fetch;
+
+    await fetchUsage(ENV_INPUT, fetchApi);
+
+    expect(seenUrls).toEqual([
+      "http://devin.internal.example.com:8080/api/org-test-1/billing/quota/usage",
+    ]);
+  });
+
   it("reports no quota when the account is not on a quota plan", async () => {
     process.env["DEVIN_API_KEY"] = "devin-token";
     process.env["DEVIN_ORG_ID"] = "org-test-1";
@@ -488,7 +505,8 @@ describe("devin usage source", () => {
 
   it("reads the CLI config with comments", async () => {
     const { credentialsPath, configPath } = writeCliStore(homeDir, {
-      config: '{\n  // the org to bill usage to\n  "devin": { "org_id": "org-test-1" }\n}\n',
+      config:
+        '{\n  // the org to bill usage to\n  "devin" /* inline note */: { "org_id": "org-test-1" }\n}\n',
     });
     const fetchApi = mockFetch(new Map([[QUOTA_URL, () => quotaResponse()]]));
 
