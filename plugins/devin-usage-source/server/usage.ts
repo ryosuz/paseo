@@ -59,6 +59,10 @@ const DevinCliConfigSchema = z.object({
 const WINDSURF_API_KEY_RE = /^\s*windsurf_api_key\s*=\s*["']([^"']+)["']/m;
 const WEBAPP_HOST_RE = /^\s*devin_webapp_host\s*=\s*["']([^"']+)["']/m;
 
+// Store states meaning "no usable login" — skipped in discovery, detailed at fetch.
+// I/O problems (permissions, I/O errors) stay ordinary errors so they surface.
+class UnusableStoreError extends Error {}
+
 // Devin config files are JSON with comments.
 function stripJsonComments(source: string): string {
   let out = "";
@@ -89,19 +93,20 @@ function stripJsonComments(source: string): string {
   return out;
 }
 
-function cliPaths(
+export function cliPaths(
   env: NodeJS.ProcessEnv,
   home: string,
+  platform: NodeJS.Platform = process.platform,
 ): {
   credentialsPath: string;
   configPath: string;
 } {
   const dataDir =
-    process.platform === "win32"
+    platform === "win32"
       ? (env.APPDATA ?? join(home, "AppData", "Roaming"))
       : (env.XDG_DATA_HOME ?? join(home, ".local", "share"));
   const configDir =
-    process.platform === "win32"
+    platform === "win32"
       ? (env.APPDATA ?? join(home, "AppData", "Roaming"))
       : (env.XDG_CONFIG_HOME ?? join(home, ".config"));
   return {
@@ -132,7 +137,7 @@ async function readCliStore(credentialsPath: string, configPath: string): Promis
     credentials = await readFile(credentialsPath, "utf8");
   } catch (error) {
     if (isNotFound(error))
-      throw new Error("Devin CLI credentials not found — run devin auth login", {
+      throw new UnusableStoreError("Devin CLI credentials not found — run devin auth login", {
         cause: error,
       });
     throw new Error(`Cannot read ${basename(credentialsPath)}: ${errorMessage(error)}`, {
@@ -140,14 +145,17 @@ async function readCliStore(credentialsPath: string, configPath: string): Promis
     });
   }
   const token = WINDSURF_API_KEY_RE.exec(credentials)?.[1];
-  if (!token) throw new Error(`${basename(credentialsPath)} does not contain windsurf_api_key`);
+  if (!token)
+    throw new UnusableStoreError(`${basename(credentialsPath)} does not contain windsurf_api_key`);
 
   let configText: string;
   try {
     configText = await readFile(configPath, "utf8");
   } catch (error) {
     if (isNotFound(error))
-      throw new Error("Devin CLI config not found — run devin auth login", { cause: error });
+      throw new UnusableStoreError("Devin CLI config not found — run devin auth login", {
+        cause: error,
+      });
     throw new Error(`Cannot read ${basename(configPath)}: ${errorMessage(error)}`, {
       cause: error,
     });
@@ -156,10 +164,10 @@ async function readCliStore(credentialsPath: string, configPath: string): Promis
   try {
     config = JSON.parse(stripJsonComments(configText));
   } catch (error) {
-    throw new Error(`${basename(configPath)} is not valid JSON`, { cause: error });
+    throw new UnusableStoreError(`${basename(configPath)} is not valid JSON`, { cause: error });
   }
   const orgId = DevinCliConfigSchema.safeParse(config).data?.devin?.org_id;
-  if (!orgId) throw new Error(`${basename(configPath)} has no devin.org_id`);
+  if (!orgId) throw new UnusableStoreError(`${basename(configPath)} has no devin.org_id`);
 
   return { token, orgId, webappHost: sanitizeWebappHost(WEBAPP_HOST_RE.exec(credentials)?.[1]) };
 }
@@ -187,7 +195,11 @@ async function resolveCredentials(input: UsageInput): Promise<DevinCredentials> 
   if (input.store === "env") {
     const missing = [input.tokenEnv, input.orgEnv].filter((name) => !process.env[name]);
     if (missing.length) throw new Error(`Devin credentials missing: set ${missing.join(" and ")}`);
-    return { token: process.env[input.tokenEnv]!, orgId: process.env[input.orgEnv]! };
+    return {
+      token: process.env[input.tokenEnv]!,
+      orgId: process.env[input.orgEnv]!,
+      webappHost: sanitizeWebappHost(process.env.DEVIN_WEBAPP_HOST),
+    };
   }
   return readCliStore(input.credentialsPath, input.configPath);
 }
@@ -229,7 +241,12 @@ function normalizeReset(value: unknown): string | undefined {
   let epoch: number | undefined;
   if (typeof value === "number" && Number.isFinite(value)) epoch = value;
   else if (typeof value === "string" && /^\d{10,13}$/.test(value)) epoch = Number(value);
-  if (epoch !== undefined) return new Date(epoch < 1e11 ? epoch * 1000 : epoch).toISOString();
+  if (epoch !== undefined) {
+    const ms = epoch < 1e11 ? epoch * 1000 : epoch;
+    // toISOString throws outside Date's representable range — drop instead.
+    if (Math.abs(ms) > 8.64e15) return undefined;
+    return new Date(ms).toISOString();
+  }
   if (typeof value === "string" && value && !Number.isNaN(Date.parse(value))) return value;
   return undefined;
 }
@@ -332,6 +349,9 @@ function accountKey(orgId: string): string {
 }
 
 export async function discover(scope: UsageScope): Promise<UsageAccount[]> {
+  // Session discovery only applies to Devin's own agent sessions — every other
+  // provider's session would otherwise surface this machine's Devin login.
+  if (scope.kind === "session" && scope.provider !== "devin") return [];
   const env = scope.kind === "session" ? scope.env : process.env;
   const home = env.HOME || env.USERPROFILE || homedir();
   const accounts: UsageAccount[] = [];
@@ -356,8 +376,9 @@ export async function discover(scope: UsageScope): Promise<UsageAccount[]> {
       harness: "Devin CLI",
       input: { store: "file", credentialsPath, configPath },
     });
-  } catch {
-    // Incomplete or unreadable stores are not usable logins.
+  } catch (error) {
+    // Unusable store contents mean "no login"; I/O failures stay visible.
+    if (!(error instanceof UnusableStoreError)) throw error;
   }
 
   return accounts;

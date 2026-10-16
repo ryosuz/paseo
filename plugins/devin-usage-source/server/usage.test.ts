@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { hashAccountKey } from "@getpaseo/plugin/server/usage";
-import { discover, fetchUsage } from "./usage.js";
-import type { UsageInput } from "../shared/input.js";
+import { cliPaths, discover, fetchUsage } from "./usage.js";
+import { inputSchema, type UsageInput } from "../shared/input.js";
 
 const QUOTA_URL = "https://app.devin.ai/api/org-test-1/billing/quota/usage";
 
@@ -75,6 +75,8 @@ describe("devin usage source", () => {
       "WINDSURF_API_KEY",
       "XDG_DATA_HOME",
       "XDG_CONFIG_HOME",
+      "DEVIN_WEBAPP_HOST",
+      "APPDATA",
     ])
       delete process.env[key];
   });
@@ -263,6 +265,39 @@ describe("devin usage source", () => {
         expect.objectContaining({ id: "weekly" }),
       ],
     });
+  });
+
+  it("omits reset timestamps outside Date's range instead of throwing", async () => {
+    process.env["DEVIN_API_KEY"] = "devin-token";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+    const fetchApi = mockFetch(
+      new Map([[QUOTA_URL, () => quotaResponse({ daily_reset_at: 1e18 })]]),
+    );
+
+    const report = await fetchUsage(ENV_INPUT, fetchApi);
+
+    expect(report).toMatchObject({
+      status: "available",
+      windows: [
+        expect.objectContaining({ id: "daily", resetsAt: null }),
+        expect.objectContaining({ id: "weekly" }),
+      ],
+    });
+  });
+
+  it("uses DEVIN_WEBAPP_HOST for env credentials", async () => {
+    process.env["DEVIN_API_KEY"] = "devin-token";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+    process.env["DEVIN_WEBAPP_HOST"] = "devin.acme.example.com";
+    const seenUrls: string[] = [];
+    const fetchApi = vi.fn(async (url: Parameters<typeof fetch>[0]) => {
+      seenUrls.push(url.toString());
+      return quotaResponse();
+    }) as unknown as typeof fetch;
+
+    await fetchUsage(ENV_INPUT, fetchApi);
+
+    expect(seenUrls).toEqual(["https://devin.acme.example.com/api/org-test-1/billing/quota/usage"]);
   });
 
   it("reports no quota when the account is not on a quota plan", async () => {
@@ -483,6 +518,8 @@ describe("account discovery", () => {
       "WINDSURF_API_KEY",
       "XDG_DATA_HOME",
       "XDG_CONFIG_HOME",
+      "DEVIN_WEBAPP_HOST",
+      "APPDATA",
     ])
       delete process.env[key];
   });
@@ -595,21 +632,54 @@ describe("account discovery", () => {
     process.env["DEVIN_API_KEY"] = "devin-token";
     process.env["DEVIN_ORG_ID"] = "org-test-1";
     const sessionHome = mkdtempSync(join(tmpdir(), "devin-session-home-"));
-    const { credentialsPath, configPath } = writeCliStore(sessionHome, {});
+    try {
+      const { credentialsPath, configPath } = writeCliStore(sessionHome, {});
 
-    const accounts = await discover({
-      kind: "session",
-      provider: "devin",
-      env: { HOME: sessionHome, DEVIN_API_KEY: "agent-token", DEVIN_ORG_ID: "org-agent" },
-    });
+      const accounts = await discover({
+        kind: "session",
+        provider: "devin",
+        env: { HOME: sessionHome, DEVIN_API_KEY: "agent-token", DEVIN_ORG_ID: "org-agent" },
+      });
 
-    expect(accounts).toEqual([
-      {
-        key: hashAccountKey("org-test-1"),
-        harness: "Devin CLI",
-        input: { store: "file", credentialsPath, configPath },
-      },
-    ]);
-    rmSync(sessionHome, { recursive: true, force: true });
+      expect(accounts).toEqual([
+        {
+          key: hashAccountKey("org-test-1"),
+          harness: "Devin CLI",
+          input: { store: "file", credentialsPath, configPath },
+        },
+      ]);
+    } finally {
+      rmSync(sessionHome, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores other providers' sessions", async () => {
+    writeCliStore(homeDir, {});
+
+    expect(
+      await discover({
+        kind: "session",
+        provider: "claude",
+        env: { HOME: homeDir },
+      }),
+    ).toEqual([]);
+  });
+
+  it("resolves Windows store paths under APPDATA", () => {
+    const paths = cliPaths({ APPDATA: "C:\\Users\\u\\AppData\\Roaming" }, "C:\\Users\\u", "win32");
+
+    expect(paths.credentialsPath).toContain("AppData");
+    expect(paths.credentialsPath).toContain("credentials.toml");
+    expect(paths.configPath).toContain("AppData");
+    expect(paths.configPath).toContain("config.json");
+  });
+
+  it("rejects inputs carrying unexpected credential-bearing fields", () => {
+    expect(
+      inputSchema.safeParse({ store: "env", tokenEnv: "T", orgEnv: "O", token: "leak" }).success,
+    ).toBe(false);
+    expect(
+      inputSchema.safeParse({ store: "file", credentialsPath: "c", configPath: "g", x: 1 }).success,
+    ).toBe(false);
   });
 });
