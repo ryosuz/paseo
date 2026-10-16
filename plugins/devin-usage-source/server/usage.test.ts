@@ -667,7 +667,8 @@ describe("account discovery", () => {
     expect(await discover(globalScope)).toEqual([]);
   });
 
-  it("honors XDG_DATA_HOME and XDG_CONFIG_HOME", async () => {
+  // Windows resolves both stores under APPDATA and never consults XDG.
+  it.skipIf(process.platform === "win32")("honors XDG_DATA_HOME and XDG_CONFIG_HOME", async () => {
     process.env["XDG_DATA_HOME"] = join(homeDir, "xdg-data");
     process.env["XDG_CONFIG_HOME"] = join(homeDir, "xdg-config");
     const { credentialsPath, configPath } = writeCliStore(homeDir, {
@@ -740,16 +741,14 @@ describe("account discovery", () => {
 
     expect(
       accounts.map((account) => (account.input as { credentialsPath: string }).credentialsPath),
-    ).toEqual([join(homeDir, ".local", "share", "devin", "credentials.toml")]);
+    ).toEqual([cliPaths(process.env, homeDir).credentialsPath]);
   });
 
   it("keeps env accounts when the CLI store fails with an I/O error", async () => {
     process.env["DEVIN_API_KEY"] = "devin-token";
     process.env["DEVIN_ORG_ID"] = "org-test-1";
     // A directory where credentials.toml belongs makes readFile fail with EISDIR.
-    mkdirSync(join(homeDir, ".local", "share", "devin", "credentials.toml"), {
-      recursive: true,
-    });
+    mkdirSync(cliPaths(process.env, homeDir).credentialsPath, { recursive: true });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     try {
