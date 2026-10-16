@@ -389,6 +389,23 @@ describe("devin usage source", () => {
     expect((offline as { error: string }).error).toContain("request failed");
   });
 
+  it("never leaks the token into network failure messages", async () => {
+    process.env["DEVIN_API_KEY"] = "devin-token\ninjected";
+    process.env["DEVIN_ORG_ID"] = "org-test-1";
+    const report = await fetchUsage(
+      ENV_INPUT,
+      vi.fn(async () => {
+        throw new TypeError('Headers.append: "devin-token\ninjected" is an invalid header value');
+      }) as never,
+    );
+
+    expect(report).toEqual({
+      status: "error",
+      error: "Devin usage API request failed (TypeError)",
+    });
+    expect(JSON.stringify(report)).not.toContain("devin-token");
+  });
+
   it("reports an unrecognized response shape", async () => {
     process.env["DEVIN_API_KEY"] = "devin-token";
     process.env["DEVIN_ORG_ID"] = "org-test-1";

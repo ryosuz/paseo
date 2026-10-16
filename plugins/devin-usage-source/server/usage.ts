@@ -222,7 +222,10 @@ async function fetchJson<Schema extends z.ZodType>(
       headers: { ...headers, Accept: "application/json" },
     });
   } catch (error) {
-    return { kind: "failed", reason: `request failed: ${errorMessage(error)}` };
+    // Never echo error.message — header validation errors quote the token.
+    const e = error as NodeJS.ErrnoException | undefined;
+    const label = e?.code ?? e?.name ?? "unknown";
+    return { kind: "failed", reason: `request failed (${label})` };
   }
   if (res.status === 401 || res.status === 403) return { kind: "rejected", status: res.status };
   if (!res.ok) return { kind: "failed", reason: `returned HTTP ${res.status}` };
